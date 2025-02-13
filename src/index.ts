@@ -1,27 +1,64 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
-import { Octokit } from "@octokit/core";
 import {
   createAckEvent,
   createDoneEvent,
   createErrorsEvent,
   createTextEvent,
-  getUserMessage,
-  prompt,
   verifyAndParseRequest,
 } from "@copilot-extensions/preview-sdk";
+import { getUserMessageWithContext } from "./utils";
+import { config } from "./config";
 
 const app = new Hono();
 
+console.log(
+  "Using Ollama API with the following URL and model:",
+  config.ollama
+);
+
+async function* getOllamaResponse(response: Response) {
+
+  console.log("response:", response);
+  
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("No response body available");
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    const chunk = new TextDecoder().decode(value);
+    const lines = chunk.split("\n").filter(Boolean);
+    
+    console.log("lines:", lines);
+
+    try {
+      for (const line of lines) {
+        const parsed = JSON.parse(line);
+
+        if (parsed.response) {
+          yield parsed.response;
+        }
+      }
+    } catch (e) {
+      throw new Error("Error parsing Ollama response:", { cause: e });
+    }
+  }
+}
+
 app.get("/", (c) => {
-  return c.text("Welcome to the Copilot Extension template! 👋");
+  return c.text("Welcome to the Ollama-powered Copilot Extension! 👋");
 });
 
 app.post("/", async (c) => {
-  // Identify the user, using the GitHub API token provided in the request headers.
   const tokenForUser = c.req.header("X-GitHub-Token") ?? "";
-
   const body = await c.req.text();
   const signature = c.req.header("github-public-key-signature") ?? "";
   const keyID = c.req.header("github-public-key-identifier") ?? "";
@@ -36,10 +73,16 @@ app.post("/", async (c) => {
   );
 
   if (!isValidRequest) {
-    console.error("Request verification failed");
-    c.header("Content-Type", "text/plain");
-    c.status(401);
-    return c.text("Request could not be verified");
+    return c.text(
+      createErrorsEvent([
+        {
+          type: "agent",
+          message: "Failed to verify the request.",
+          code: "INVALID_REQUEST",
+          identifier: "invalid_request",
+        },
+      ])
+    );
   }
 
   if (!tokenForUser) {
@@ -60,22 +103,46 @@ app.post("/", async (c) => {
 
   return stream(c, async (stream) => {
     try {
-      // Let GitHub Copilot know we are doing something
       stream.write(createAckEvent());
 
-      const octokit = new Octokit({ auth: tokenForUser });
-      const user = await octokit.request("GET /user");
-      const userPrompt = getUserMessage(payload);
+      // TODO: detect file selection in question and use it as context instead of the whole file
+      const userPrompt = getUserMessageWithContext({ payload, type: "file" });
 
-      const { message } = await prompt(userPrompt, {
-        token: tokenForUser,
-      });
+      const ollamaResponse = await fetch(
+        `${config.ollama.baseUrl}/api/generate`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: config.ollama.model,
+            prompt: userPrompt,
+            stream: true,
+          }),
+        }
+      );
 
-      stream.write(createTextEvent(`Hi ${user.data.login}! `));
+      if (!ollamaResponse.ok) {
+        stream.write(
+          createErrorsEvent([
+            {
+              type: "agent",
+              message: `Ollama request failed: ${ollamaResponse.statusText}`,
+              code: "OLLAMA_REQUEST_FAILED",
+              identifier: "ollama_request_failed",
+            },
+          ])
+        );
+      }
 
-      stream.write(createTextEvent(message.content));
+      for await (const chunk of getOllamaResponse(ollamaResponse)) {
+        stream.write(createTextEvent(chunk));
+      }
+
       stream.write(createDoneEvent());
     } catch (error) {
+      console.error("Error:", error);
       stream.write(
         createErrorsEvent([
           {
@@ -90,10 +157,9 @@ app.post("/", async (c) => {
   });
 });
 
-const port = 3000;
-console.log(`Server is running on port ${port}`);
+console.log(`Server is running on port ${config.server.port}`);
 
 serve({
   fetch: app.fetch,
-  port,
+  port: Number(config.server.port),
 });
